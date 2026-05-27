@@ -170,8 +170,10 @@ typedef struct {            /* tcp control type */
     struct sockaddr_in addr; /* address resolved */
     socket_t sock;          /* socket descriptor */
     int tcon;               /* reconnect time (ms) (-1:never,0:now) */
-    uint32_t tact;          /* data active tick */
+    uint32_t tact;          /* data active tick (read or write) */
+    uint32_t tactr;         /* receive active tick (read only) */
     uint32_t tdis;          /* disconnect tick */
+    int rxact;              /* received data since connect (0:no,1:yes) */
 } tcp_t;
 
 typedef struct tcpsvr_tag { /* tcp server type */
@@ -1443,6 +1445,8 @@ static int consock(tcpcli_t *tcpcli, char *msg)
     tracet(3,"consock: connected sock=%d addr=%s\n",tcpcli->svr.sock,tcpcli->svr.saddr);
     tcpcli->svr.state=2;
     tcpcli->svr.tact=tickget();
+    tcpcli->svr.tactr=tcpcli->svr.tact;
+    tcpcli->svr.rxact=0;      /* re-arm receive watchdog on each (re)connect */
     return 1;
 }
 /* open tcp client -----------------------------------------------------------*/
@@ -1489,8 +1493,13 @@ static int waittcpcli(tcpcli_t *tcpcli, char *msg)
         if (!consock(tcpcli,msg)) return 0;
     }
     if (tcpcli->svr.state==2) { /* connect */
+        /* Once any data has been received, base the inactivity timeout on
+         * receive activity only, so periodic uploads (e.g. NMEA/GGA from -n)
+         * cannot mask a one-way inbound stall. Output-only clients that have
+         * never received fall back to general (read-or-write) activity. */
+        uint32_t tref=tcpcli->svr.rxact?tcpcli->svr.tactr:tcpcli->svr.tact;
         if (tcpcli->toinact>0&&
-            (int)(tickget()-tcpcli->svr.tact)>tcpcli->toinact) {
+            (int)(tickget()-tref)>tcpcli->toinact) {
             sprintf(msg,"timeout");
             tracet(2,"waittcpcli: inactive timeout sock=%d\n",tcpcli->svr.sock);
             discontcp(&tcpcli->svr,tcpcli->tirecon);
@@ -1519,7 +1528,10 @@ static int readtcpcli(tcpcli_t *tcpcli, uint8_t *buff, int n, char *msg)
         discontcp(&tcpcli->svr,tcpcli->tirecon);
         return 0;
     }
-    if (nr>0) tcpcli->svr.tact=tickget();
+    if (nr>0) {
+        tcpcli->svr.tact=tcpcli->svr.tactr=tickget();
+        tcpcli->svr.rxact=1;
+    }
     tracet(5,"readtcpcli: exit sock=%d nr=%d\n",tcpcli->svr.sock,nr);
     return nr;
 }
