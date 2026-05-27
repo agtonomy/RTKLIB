@@ -170,8 +170,10 @@ typedef struct {            /* tcp control type */
     struct sockaddr_in addr; /* address resolved */
     socket_t sock;          /* socket descriptor */
     int tcon;               /* reconnect time (ms) (-1:never,0:now) */
-    uint32_t tact;          /* data active tick */
+    uint32_t tact;          /* data active tick (read or write) */
+    uint32_t tactr;         /* receive active tick (read only) */
     uint32_t tdis;          /* disconnect tick */
+    int rxto;               /* base inactive timeout on receives (1:download) */
 } tcp_t;
 
 typedef struct tcpsvr_tag { /* tcp server type */
@@ -1454,6 +1456,7 @@ static int consock(tcpcli_t *tcpcli, char *msg)
     tracet(3,"consock: connected sock=%d addr=%s\n",tcpcli->svr.sock,tcpcli->svr.saddr);
     tcpcli->svr.state=2;
     tcpcli->svr.tact=tickget();
+    tcpcli->svr.tactr=tcpcli->svr.tact; /* re-arm watchdog on each (re)connect */
     return 1;
 }
 /* open tcp client -----------------------------------------------------------*/
@@ -1490,9 +1493,9 @@ static void closetcpcli(tcpcli_t *tcpcli)
 static int waittcpcli(tcpcli_t *tcpcli, char *msg)
 {
     tracet(4,"waittcpcli: sock=%d state=%d\n",tcpcli->svr.sock,tcpcli->svr.state);
-    
+
     if (tcpcli->svr.state<0) return 0;
-    
+
     if (tcpcli->svr.state==0) { /* close */
         if (!gentcp(&tcpcli->svr,1,msg)) return 0;
     }
@@ -1500,8 +1503,18 @@ static int waittcpcli(tcpcli_t *tcpcli, char *msg)
         if (!consock(tcpcli,msg)) return 0;
     }
     if (tcpcli->svr.state==2) { /* connect */
+        /* Base the inactivity timeout on the connection's role, not on the
+         * current read/write call: str2str reads and writes both input and
+         * output streams (an output is opened RW and drained every cycle by
+         * strsvrthread), so the operation cannot tell input from output.
+         * Downloads (rxto, set for ntrip clients) key on receive activity
+         * (tactr) so periodic uploads (e.g. NMEA/GGA from -n) cannot mask a
+         * one-way inbound stall. Uploads (ntrip servers, plain tcp clients)
+         * key on general activity (tact, refreshed by writes) so they are not
+         * falsely timed out after the single handshake response they receive. */
+        uint32_t tref=tcpcli->svr.rxto?tcpcli->svr.tactr:tcpcli->svr.tact;
         if (tcpcli->toinact>0&&
-            (int)(tickget()-tcpcli->svr.tact)>tcpcli->toinact) {
+            (int)(tickget()-tref)>tcpcli->toinact) {
             sprintf(msg,"timeout");
             tracet(2,"waittcpcli: inactive timeout sock=%d\n",tcpcli->svr.sock);
             discontcp(&tcpcli->svr,tcpcli->tirecon);
@@ -1516,7 +1529,7 @@ static int readtcpcli(tcpcli_t *tcpcli, uint8_t *buff, int n, char *msg)
     int nr,err;
     
     tracet(4,"readtcpcli: sock=%d\n",tcpcli->svr.sock);
-    
+
     if (!waittcpcli(tcpcli,msg)) return 0;
     
     if ((nr=recv_nb(tcpcli->svr.sock,buff,n,&err))==-1) {
@@ -1530,7 +1543,7 @@ static int readtcpcli(tcpcli_t *tcpcli, uint8_t *buff, int n, char *msg)
         discontcp(&tcpcli->svr,tcpcli->tirecon);
         return 0;
     }
-    if (nr>0) tcpcli->svr.tact=tickget();
+    if (nr>0) tcpcli->svr.tact=tcpcli->svr.tactr=tickget();
     tracet(5,"readtcpcli: exit sock=%d nr=%d\n",tcpcli->svr.sock,nr);
     return nr;
 }
@@ -1540,7 +1553,7 @@ static int writetcpcli(tcpcli_t *tcpcli, uint8_t *buff, int n, char *msg)
     int ns,err;
     
     tracet(3,"writetcpcli: sock=%d state=%d n=%d\n",tcpcli->svr.sock,tcpcli->svr.state,n);
-    
+
     if (!waittcpcli(tcpcli,msg)) return 0;
     
     if ((ns=send_nb(tcpcli->svr.sock,buff,n,&err))==-1) {
@@ -1799,6 +1812,10 @@ static ntrip_t *openntrip(const char *path, int type, char *msg)
         free(ntrip);
         return NULL;
     }
+    /* ntrip clients (downloads) time out on lack of received data; ntrip
+     * servers (uploads) only ever receive the handshake response, so they
+     * time out on lack of sent data (the tcpcli default). */
+    ntrip->tcp->svr.rxto=(type==1);
     return ntrip;
 }
 /* close ntrip ---------------------------------------------------------------*/
